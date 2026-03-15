@@ -28,41 +28,24 @@ intents.members = True
 
 bot = commands.Bot(command_prefix="!", intents=intents)
 
-# ================= STOCK JSON =================
-def load_stock() -> list:
-    if not os.path.exists(STOCK_PATH):
-        return []
-    with open(STOCK_PATH, "r", encoding="utf-8") as f:
-        try:
-            return json.load(f)
-        except json.JSONDecodeError:
-            return []
-
-def save_stock(stock: list):
-    with open(STOCK_PATH, "w", encoding="utf-8") as f:
-        json.dump(stock, f, indent=2, ensure_ascii=False)
-
-def add_accounts_to_stock(accounts: list):
-    """accounts is a list of {"username": ..., "password": ..., "games": ...}"""
-    stock = load_stock()
-    existing = {f"{a['username']}:{a['password']}" for a in stock}
-    added = 0
-    for acc in accounts:
-        key = f"{acc['username']}:{acc['password']}"
-        if key not in existing:
-            stock.append(acc)
-            existing.add(key)
-            added += 1
-    save_stock(stock)
-    return added
-
-# ================= DATABASE (gens/reports/referrals only) =================
+# ================= DATABASE =================
 def db():
     return sqlite3.connect(DB_PATH)
 
 def init_db():
     with db() as con:
         cur = con.cursor()
+
+        # Stock stored in DB — persists across deploys
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS stock (
+            id       INTEGER PRIMARY KEY AUTOINCREMENT,
+            username TEXT NOT NULL,
+            password TEXT NOT NULL,
+            games    TEXT NOT NULL,
+            UNIQUE(username, password)
+        )
+        """)
 
         cur.execute("""
         CREATE TABLE IF NOT EXISTS gens (
@@ -90,6 +73,70 @@ def init_db():
             user_id INTEGER UNIQUE
         )
         """)
+
+        # Migrate existing stock.json into DB if present
+        if os.path.exists(STOCK_PATH):
+            try:
+                with open(STOCK_PATH, "r", encoding="utf-8") as f:
+                    old = json.load(f)
+                migrated = 0
+                for a in old:
+                    try:
+                        cur.execute(
+                            "INSERT OR IGNORE INTO stock (username, password, games) VALUES (?,?,?)",
+                            (a["username"], a["password"], a["games"])
+                        )
+                        migrated += 1
+                    except Exception:
+                        pass
+                con.commit()
+                os.rename(STOCK_PATH, STOCK_PATH + ".migrated")
+                print(f"✅ Migrated {migrated} accounts from stock.json to DB")
+            except Exception as e:
+                print(f"⚠️ Migration skipped: {e}")
+
+
+def load_stock() -> list:
+    """Load all accounts from DB as list of dicts."""
+    with db() as con:
+        cur = con.cursor()
+        cur.execute("SELECT username, password, games FROM stock")
+        return [{"username": r[0], "password": r[1], "games": r[2]} for r in cur.fetchall()]
+
+
+def save_stock(stock: list):
+    """Replace entire stock (used for bulk operations)."""
+    with db() as con:
+        con.execute("DELETE FROM stock")
+        cur = con.cursor()
+        for a in stock:
+            try:
+                cur.execute(
+                    "INSERT OR IGNORE INTO stock (username, password, games) VALUES (?,?,?)",
+                    (a["username"], a["password"], a["games"])
+                )
+            except Exception:
+                pass
+        con.commit()
+
+
+def add_accounts_to_stock(accounts: list) -> int:
+    """Add accounts to DB, skip duplicates. Returns count added."""
+    added = 0
+    with db() as con:
+        cur = con.cursor()
+        for acc in accounts:
+            try:
+                cur.execute(
+                    "INSERT OR IGNORE INTO stock (username, password, games) VALUES (?,?,?)",
+                    (acc["username"], acc["password"], acc["games"])
+                )
+                if cur.rowcount > 0:
+                    added += 1
+            except Exception:
+                pass
+        con.commit()
+    return added
 
 # ================= HELPERS =================
 def has_role(member, role_id):
@@ -154,12 +201,24 @@ def is_credential_line(line: str) -> bool:
         return False
     return True
 
+def normalise_games(games_str: str) -> str:
+    """Normalise game separators to comma-separated, clean whitespace."""
+    # Replace common separators with comma
+    for sep in [" | ", " / ", " + ", "\n", " & ", " ; "]:
+        games_str = games_str.replace(sep, ", ")
+    # Clean up multiple commas/spaces
+    parts = [g.strip() for g in games_str.split(",") if g.strip()]
+    return ", ".join(parts)
+
 def parse_file(text: str):
     """
-    Supports:
-      Format 1 (inline):  user:pass – Game Name
-      Format 2 (block):   Game1\nGame2\nuser:pass
-    Returns list of (username, password, games)
+    Supports many formats:
+      Format 1 (inline dash):   user:pass - Game1, Game2
+      Format 2 (inline pipe):   user:pass | Game1 | Game2
+      Format 3 (block):         Game1\nGame2\nuser:pass
+      Format 4 (labeled):       Username: user\nPassword: pass\nGames: game1, game2
+      Format 5 (colon sep):     user:pass:game1:game2  (rare)
+    Returns list of (username, password, games_string)
     """
     results = []
     lines = [l.rstrip() for l in text.splitlines()]
@@ -172,58 +231,98 @@ def parse_file(text: str):
             i += 1
             continue
 
-        # Inline format
-        normalised = line.replace(" \u2013 ", "|").replace(" \u2014 ", "|").replace(" - ", "|").replace(" | ", "|")
-        normalised = normalised.replace("GAMES:", "").replace("Games:", "").replace("games:", "").strip()
+        # ── Format 4: labeled block (Username:/Password:/Games:) ──
+        if line.lower().startswith(("username:", "user:")):
+            label_block = {}
+            while i < len(lines) and lines[i].strip():
+                l = lines[i].strip()
+                if ":" in l:
+                    key, val = l.split(":", 1)
+                    label_block[key.strip().lower()] = val.strip()
+                i += 1
+            user = label_block.get("username") or label_block.get("user", "")
+            pwd  = label_block.get("password") or label_block.get("pass", "")
+            games = label_block.get("games") or label_block.get("game", "")
+            if user and pwd and games:
+                results.append((user, pwd, normalise_games(games)))
+            continue
 
-        if "|" in normalised and ":" in normalised.split("|")[0]:
-            parts = normalised.split("|", 1)
-            creds = parts[0].strip()
-            games = parts[1].strip()
-            if ":" in creds and games:
-                user, pwd = creds.split(":", 1)
-                if user.strip() and pwd.strip():
-                    results.append((user.strip(), pwd.strip(), games.strip()))
+        # ── Normalise inline separators ──────────────────────────
+        norm = line
+        # Replace em/en dash and common separators BEFORE the game part
+        for sep in [" \u2013 ", " \u2014 ", " - ", " – ", " — "]:
+            if sep in norm:
+                norm = norm.replace(sep, "|", 1)
+                break
+        norm = norm.replace("GAMES:", "").replace("Games:", "").replace("games:", "").strip()
+
+        # ── Format 1 & 2: inline  creds|games ───────────────────
+        if "|" in norm:
+            parts = norm.split("|")
+            creds_part = parts[0].strip()
+            games_part = ", ".join(p.strip() for p in parts[1:] if p.strip())
+            if ":" in creds_part and games_part:
+                user, pwd = creds_part.split(":", 1)
+                user, pwd = user.strip(), pwd.strip()
+                if user and pwd:
+                    results.append((user, pwd, normalise_games(games_part)))
                     i += 1
                     continue
 
-        # Block format
+        # ── Format 3: block  (games on top lines, creds at bottom) ─
         block_lines = []
-        while i < len(lines) and lines[i].strip():
-            block_lines.append(lines[i].strip())
-            i += 1
+        j = i
+        while j < len(lines) and lines[j].strip():
+            block_lines.append(lines[j].strip())
+            j += 1
 
         if not block_lines:
             i += 1
             continue
 
+        # Find credential line — could be anywhere in the block
         cred_index = None
-        for j, bl in enumerate(block_lines):
+        for k, bl in enumerate(block_lines):
             if is_credential_line(bl):
-                cred_index = j
+                cred_index = k
                 break
 
         if cred_index is None:
+            i = j
             continue
 
+        cred_line  = block_lines[cred_index]
+        # Game lines are everything before the credential line
         game_lines = [bl for bl in block_lines[:cred_index] if bl]
-        cred_line = block_lines[cred_index]
+        # Also collect game lines AFTER cred line (some formats list games below)
+        post_lines = block_lines[cred_index + 1:]
+        # Post lines that don't look like creds are extra game info
+        for pl in post_lines:
+            if not is_credential_line(pl) and pl:
+                game_lines.append(pl)
 
         user, pwd = cred_line.split(":", 1)
-        user = user.strip()
-        pwd = pwd.strip()
+        user, pwd = user.strip(), pwd.strip()
 
-        if not pwd and cred_index + 1 < len(block_lines):
-            pwd = block_lines[cred_index + 1].strip()
+        # If password is empty and next line exists, use it
+        if not pwd and post_lines:
+            pwd = post_lines[0].strip()
+            game_lines = [bl for bl in block_lines[:cred_index] if bl]
 
         if not user or not pwd:
+            i = j
             continue
 
-        games = ", ".join(game_lines) if game_lines else None
+        # Build games string from collected game lines
+        raw_games = ", ".join(game_lines)
+        games = normalise_games(raw_games) if raw_games.strip() else None
+
         if not games:
+            i = j
             continue
 
         results.append((user, pwd, games))
+        i = j
 
     return results
 
@@ -274,74 +373,131 @@ class GameView(discord.ui.View):
 async def steamaccount(interaction: discord.Interaction, game: str):
     await interaction.response.defer(ephemeral=True)
 
-    used = used_today(interaction.user.id)
+    used  = used_today(interaction.user.id)
     limit = daily_limit(interaction.user)
 
     if used >= limit:
-        await interaction.followup.send(f"❌ Daily limit reached ({limit}/day).", ephemeral=True)
+        await interaction.followup.send(f"❌ Daily limit reached ({used}/{limit} today).", ephemeral=True)
         return
 
     stock = load_stock()
-    matches = [a for a in stock if game.lower() in a["games"].lower()]
+    game_lower = game.lower().strip()
+
+    # Match accounts that have this game — check each individual game in the list
+    def has_game(acc):
+        for g in acc["games"].split(","):
+            if game_lower in g.strip().lower():
+                return True
+        return False
+
+    matches = [a for a in stock if has_game(a)]
 
     if not matches:
-        await interaction.followup.send("❌ No accounts available for that game.", ephemeral=True)
+        # Try fuzzy — check if any word in game name matches
+        words = [w for w in game_lower.split() if len(w) > 2]
+        if words:
+            matches = [
+                a for a in stock
+                if any(w in a["games"].lower() for w in words)
+            ]
+
+    if not matches:
+        # Show available games as hint
+        all_games = sorted({
+            g.strip()
+            for a in stock
+            for g in a["games"].split(",")
+            if g.strip()
+        })
+        hint = ", ".join(all_games[:10]) + ("..." if len(all_games) > 10 else "")
+        await interaction.followup.send(
+            f"❌ No accounts found for **{game}**.\n"
+            f"Available games: {hint}\n"
+            f"Use `/listgames` to see the full list.",
+            ephemeral=True
+        )
         return
 
-    acc = random.choice(matches)
-    user, pwd, games = acc["username"], acc["password"], acc["games"]
+    acc  = random.choice(matches)
+    user = acc["username"]
+    pwd  = acc["password"]
+    games = acc["games"]
 
     with db() as con:
         con.execute("INSERT INTO gens VALUES (?,?)", (interaction.user.id, date.today().isoformat()))
 
     embed = discord.Embed(
-        title="🎮 Generated Steam Account",
-        description="Crimson Gen has agreed to only distribute accounts they own. Crimson Gen takes no responsibility for what you do with these accounts.",
+        title="🎮 Steam Account Generated",
+        description="Please change the password after logging in. Do not share this account.",
         color=discord.Color.blue()
     )
     embed.set_thumbnail(url="https://cdn.discordapp.com/attachments/1470798856085307423/1471984801266532362/IMG_7053.gif")
-    embed.add_field(name="🔐 Account Details", value=f"`{user}:{pwd}`", inline=False)
-    embed.add_field(name="🎮 Games", value=games if len(games) < 1024 else games[:1021] + "...", inline=False)
-    embed.set_footer(text="Enjoy! ❤️")
+    embed.add_field(name="🔐 Credentials", value=f"`{user}:{pwd}`", inline=False)
+    embed.add_field(name="🎮 Games on Account", value=games[:1024] if len(games) < 1024 else games[:1021] + "...", inline=False)
+    embed.add_field(name="📊 Daily Usage", value=f"`{used + 1}/{limit}`", inline=True)
+    embed.set_footer(text="Crimson Gen  ·  Steam Accounts")
 
     try:
         await interaction.user.send(embed=embed)
         await interaction.followup.send("✅ Account sent to your DMs!", ephemeral=True)
     except discord.Forbidden:
         await interaction.followup.send(
-            f"❌ Couldn't send DM. Please enable DMs from server members.\n\n**Account:** `{user}:{pwd}`",
+            f"❌ Couldn't DM you. Enable DMs from server members.\n\n**Account:** `{user}:{pwd}`",
             ephemeral=True
         )
 
 
-@bot.tree.command(name="listgames", description="View available games")
+@bot.tree.command(name="listgames", description="View available games in stock")
 async def listgames(interaction: discord.Interaction):
     stock = load_stock()
-    games = sorted({
-        g.strip()
-        for acc in stock
-        for g in acc["games"].split(",")
-        if g.strip()
-    })
+    # Count stock per game
+    game_counts: dict[str, int] = {}
+    for acc in stock:
+        for g in acc["games"].split(","):
+            g = g.strip()
+            if g:
+                game_counts[g] = game_counts.get(g, 0) + 1
 
-    if not games:
-        await interaction.response.send_message("❌ No games available.")
+    if not game_counts:
+        await interaction.response.send_message("❌ No games in stock.", ephemeral=True)
         return
 
+    sorted_games = sorted(game_counts.items(), key=lambda x: x[0].lower())
     pages = []
-    for i in range(0, len(games), 15):
-        pages.append("🎮 **Available Games**\n" + "\n".join(games[i:i + 15]))
+    chunk = []
+    for name, count in sorted_games:
+        chunk.append(f"• **{name}** — `{count}`")
+        if len(chunk) == 15:
+            pages.append("🎮 **Available Games**\n" + "\n".join(chunk))
+            chunk = []
+    if chunk:
+        pages.append("🎮 **Available Games**\n" + "\n".join(chunk))
 
     view = GameView(interaction.user.id, pages)
     view.update()
-    await interaction.response.send_message(pages[0], view=view)
+    await interaction.response.send_message(pages[0], view=view, ephemeral=True)
 
 
-@bot.tree.command(name="search", description="Search stock for a game")
+@bot.tree.command(name="search", description="Search stock for a specific game")
 async def search(interaction: discord.Interaction, game: str):
     stock = load_stock()
-    count = sum(1 for a in stock if game.lower() in a["games"].lower())
-    await interaction.response.send_message(f"🔍 **{game}** stock: **{count}**")
+    game_lower = game.lower().strip()
+
+    count = sum(
+        1 for a in stock
+        if any(game_lower in g.strip().lower() for g in a["games"].split(","))
+    )
+
+    if count == 0:
+        await interaction.response.send_message(
+            f"❌ No accounts found for **{game}**. Use `/listgames` to see what's available.",
+            ephemeral=True
+        )
+    else:
+        await interaction.response.send_message(
+            f"🔍 **{game}** — `{count}` account(s) in stock",
+            ephemeral=True
+        )
 
 
 @bot.tree.command(name="stock", description="View total available accounts")
@@ -451,10 +607,6 @@ async def report(interaction: discord.Interaction, account: str, reason: str = "
 async def restock(interaction: discord.Interaction, file: discord.Attachment):
     await interaction.response.defer(ephemeral=True)
 
-    if not staff_only(interaction):
-        await interaction.followup.send("❌ You don't have permission to use this command.", ephemeral=True)
-        return
-
     try:
         text = (await file.read()).decode("utf-8", errors="ignore")
     except Exception as e:
@@ -463,13 +615,21 @@ async def restock(interaction: discord.Interaction, file: discord.Attachment):
 
     parsed = parse_file(text)
     if not parsed:
-        await interaction.followup.send("❌ No valid accounts found in file.", ephemeral=True)
+        await interaction.followup.send(
+            "❌ No valid accounts found in file.\n"
+            "Supported formats:\n"
+            "• `user:pass - Game1, Game2`\n"
+            "• `user:pass | Game1 | Game2`\n"
+            "• Block: games on lines above `user:pass`",
+            ephemeral=True
+        )
         return
 
     accounts = [{"username": u, "password": p, "games": g} for u, p, g in parsed]
-    added = add_accounts_to_stock(accounts)
+    added    = add_accounts_to_stock(accounts)
 
-    game_counts = {}
+    # Count per individual game across all added accounts
+    game_counts: dict[str, int] = {}
     for acc in accounts:
         for g in acc["games"].split(","):
             g = g.strip()
@@ -477,12 +637,24 @@ async def restock(interaction: discord.Interaction, file: discord.Attachment):
                 game_counts[g] = game_counts.get(g, 0) + 1
 
     embed = discord.Embed(title="🔄 Restock Complete", color=discord.Color.green())
-    stock_lines = "\n".join(
-        f"**{game}:** `{count}` added"
-        for game, count in sorted(game_counts.items(), key=lambda x: x[0].lower())
-    )
-    embed.add_field(name="📦 Games Added", value=stock_lines or "None", inline=False)
-    embed.set_footer(text=f"✅ {added} new account(s) added to stock.json")
+    embed.add_field(name="📥 Parsed",    value=f"`{len(parsed)}`",  inline=True)
+    embed.add_field(name="✅ New Added", value=f"`{added}`",         inline=True)
+    embed.add_field(name="♻️ Dupes Skipped", value=f"`{len(parsed) - added}`", inline=True)
+
+    if game_counts:
+        sorted_games = sorted(game_counts.items(), key=lambda x: x[0].lower())
+        # Split into chunks if too many games
+        chunk_size = 15
+        chunks = [sorted_games[i:i+chunk_size] for i in range(0, len(sorted_games), chunk_size)]
+        for idx, chunk in enumerate(chunks):
+            field_val = "\n".join(f"• **{g}** — `{c}`" for g, c in chunk)
+            embed.add_field(
+                name=f"🎮 Games ({idx+1}/{len(chunks)})" if len(chunks) > 1 else "🎮 Games Restocked",
+                value=field_val[:1024],
+                inline=False
+            )
+
+    embed.set_footer(text=f"Crimson Gen  ·  Restock  ·  {added} new account(s) added")
     await interaction.followup.send(embed=embed, ephemeral=True)
 
 
@@ -565,6 +737,34 @@ async def globalstats(interaction: discord.Interaction):
         f"Total gens: **{gens}**",
         ephemeral=True
     )
+
+@bot.tree.command(name="downloadstock", description="Download all stock as a JSON file")
+@app_commands.check(staff_only)
+async def downloadstock(interaction: discord.Interaction):
+    await interaction.response.defer(ephemeral=True)
+    stock = load_stock()
+    if not stock:
+        await interaction.followup.send("❌ Stock is empty.", ephemeral=True)
+        return
+
+    import io
+    data    = json.dumps(stock, indent=2, ensure_ascii=False).encode("utf-8")
+    file    = discord.File(io.BytesIO(data), filename="stock.json")
+    total   = len(stock)
+
+    game_counts: dict[str, int] = {}
+    for acc in stock:
+        for g in acc["games"].split(","):
+            g = g.strip()
+            if g:
+                game_counts[g] = game_counts.get(g, 0) + 1
+
+    embed = discord.Embed(title="📦 Stock Download", color=discord.Color.blue())
+    embed.add_field(name="✅ Total Accounts", value=f"`{total}`", inline=True)
+    embed.add_field(name="🎮 Unique Games",   value=f"`{len(game_counts)}`", inline=True)
+    embed.set_footer(text="Crimson Gen  ·  Staff Only")
+    await interaction.followup.send(embed=embed, file=file, ephemeral=True)
+
 
 # ================= START BOT =================
 bot.run(TOKEN)
