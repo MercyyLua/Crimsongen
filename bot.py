@@ -522,7 +522,12 @@ async def search(interaction: discord.Interaction, game: str):
 @bot.tree.command(name="stock", description="View total available accounts")
 async def stock_cmd(interaction: discord.Interaction):
     stock = load_stock()
-    total = len(stock)
+
+    # Count total game slots (1 account with 5 games = 5 stock)
+    total = sum(
+        len([g for g in acc["games"].split(",") if g.strip()])
+        for acc in stock
+    )
 
     with db() as con:
         cur = con.cursor()
@@ -533,7 +538,7 @@ async def stock_cmd(interaction: discord.Interaction):
 
     embed = discord.Embed(title="📦 Stock", color=discord.Color.blue())
     embed.add_field(name="✅ Available", value=f"**{available}** account(s)", inline=False)
-    embed.add_field(name="🚨 Reported", value=f"**{reported}** account(s)", inline=False)
+    embed.add_field(name="🚨 Reported",  value=f"**{reported}** account(s)",  inline=False)
     await interaction.response.send_message(embed=embed)
 
 
@@ -740,7 +745,11 @@ async def resetallreports(interaction: discord.Interaction):
 @app_commands.check(staff_only)
 async def globalstats(interaction: discord.Interaction):
     stock = load_stock()
-    total = len(stock)
+    total = sum(
+        len([g for g in acc["games"].split(",") if g.strip()])
+        for acc in stock
+    )
+    unique_accounts = len(stock)
 
     with db() as con:
         cur = con.cursor()
@@ -751,7 +760,7 @@ async def globalstats(interaction: discord.Interaction):
 
     await interaction.response.send_message(
         f"🌍 **Global Stats**\n"
-        f"Total accounts: **{total}**\n"
+        f"Total stock: **{total}** (across **{unique_accounts}** accounts)\n"
         f"Reported: **{reported}**\n"
         f"Total gens: **{gens}**",
         ephemeral=True
