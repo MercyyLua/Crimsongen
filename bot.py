@@ -13,8 +13,11 @@ TOKEN = os.getenv("TOKEN")
 if not TOKEN:
     raise RuntimeError("DISCORD TOKEN MISSING")
 
-DB_PATH = "steam_bot.db"
-STOCK_PATH = "stock.json"
+DB_PATH = os.getenv("DB_PATH", "/app/data/steam_bot.db")
+STOCK_PATH = os.getenv("STOCK_PATH", "/app/data/stock.json")
+
+# Ensure data directory exists
+os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
 
 MEMBER_ROLE_ID = 1471512804535046237
 BOOSTER_ROLE_ID = 1469733875709378674
@@ -73,6 +76,21 @@ def init_db():
         cur.execute("""
         CREATE TABLE IF NOT EXISTS referral_uses (
             user_id INTEGER UNIQUE
+        )
+        """)
+
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS referral_daily (
+            user_id INTEGER,
+            day     TEXT,
+            PRIMARY KEY (user_id, day)
+        )
+        """)
+
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS vip_users (
+            user_id INTEGER UNIQUE,
+            bonus   INTEGER DEFAULT 3
         )
         """)
 
@@ -165,12 +183,27 @@ def has_referral(user_id):
         cur.execute("SELECT 1 FROM referral_uses WHERE user_id=?", (user_id,))
         return cur.fetchone() is not None
 
+def used_referral_today(user_id):
+    with db() as con:
+        cur = con.cursor()
+        cur.execute("SELECT 1 FROM referral_daily WHERE user_id=? AND day=?",
+                    (user_id, date.today().isoformat()))
+        return cur.fetchone() is not None
+
+def get_vip_bonus(user_id):
+    with db() as con:
+        cur = con.cursor()
+        cur.execute("SELECT bonus FROM vip_users WHERE user_id=?", (user_id,))
+        row = cur.fetchone()
+        return row[0] if row else 0
+
 def daily_limit(member):
     if any(has_role(member, r) for r in (STAFF_ROLE_ID, STAFF_ROLE_2_ID, STAFF_ROLE_3_ID)):
         return 999
     limit = base_limit(member)
     if has_referral(member.id):
         limit += 1
+    limit += get_vip_bonus(member.id)
     return limit
 
 def used_today(user_id):
@@ -404,7 +437,7 @@ async def steamaccount(interaction: discord.Interaction, game: str):
     limit = daily_limit(interaction.user)
 
     if used >= limit:
-        await interaction.followup.send(f"❌ Daily limit reached ({used}/{limit} today).", ephemeral=True)
+        await interaction.followup.send(f"❌ Daily limit reached ({used}/{limit} today, delete_after=90).", ephemeral=True)
         return
 
     stock = load_stock()
@@ -440,9 +473,7 @@ async def steamaccount(interaction: discord.Interaction, game: str):
         await interaction.followup.send(
             f"❌ No accounts found for **{game}**.\n"
             f"Available games: {hint}\n"
-            f"Use `/listgames` to see the full list.",
-            ephemeral=True
-        )
+            f"Use `/listgames` to see the full list.", ephemeral=True)
         return
 
     acc  = random.choice(matches)
@@ -469,9 +500,7 @@ async def steamaccount(interaction: discord.Interaction, game: str):
         await interaction.followup.send("✅ Account sent to your DMs!", ephemeral=True)
     except discord.Forbidden:
         await interaction.followup.send(
-            f"❌ Couldn't DM you. Enable DMs from server members.\n\n**Account:** `{user}:{pwd}`",
-            ephemeral=True
-        )
+            f"❌ Couldn't DM you. Enable DMs from server members.\n\n**Account:** `{user}:{pwd}`", ephemeral=True)
 
 
 @bot.tree.command(name="listgames", description="View available games in stock")
@@ -485,7 +514,7 @@ async def listgames(interaction: discord.Interaction):
     })
 
     if not games:
-        await interaction.response.send_message("❌ No games available.")
+        await interaction.response.send_message("❌ No games available.", delete_after=90)
         return
 
     pages = []
@@ -494,7 +523,7 @@ async def listgames(interaction: discord.Interaction):
 
     view = GameView(interaction.user.id, pages)
     view.update()
-    await interaction.response.send_message(pages[0], view=view)
+    await interaction.response.send_message(pages[0], view=view, delete_after=90)
 
 
 @bot.tree.command(name="search", description="Search stock for a specific game")
@@ -509,14 +538,10 @@ async def search(interaction: discord.Interaction, game: str):
 
     if count == 0:
         await interaction.response.send_message(
-            f"❌ No accounts found for **{game}**. Use `/listgames` to see what's available.",
-            ephemeral=True
-        )
+            f"❌ No accounts found for **{game}**. Use `/listgames` to see what's available.", ephemeral=True)
     else:
         await interaction.response.send_message(
-            f"🔍 **{game}** — `{count}` account(s) in stock",
-            ephemeral=True
-        )
+            f"🔍 **{game}** — `{count}` account(s, delete_after=90) in stock", ephemeral=True)
 
 
 @bot.tree.command(name="stock", description="View total available accounts")
@@ -539,7 +564,7 @@ async def stock_cmd(interaction: discord.Interaction):
     embed = discord.Embed(title="📦 Stock", color=discord.Color.blue())
     embed.add_field(name="✅ Available", value=f"**{available}** account(s)", inline=False)
     embed.add_field(name="🚨 Reported",  value=f"**{reported}** account(s)",  inline=False)
-    await interaction.response.send_message(embed=embed)
+    await interaction.response.send_message(embed=embed, delete_after=90)
 
 
 @bot.tree.command(name="mystats", description="View your stats")
@@ -551,9 +576,7 @@ async def mystats(interaction: discord.Interaction):
     await interaction.response.send_message(
         f"📊 **Your Stats**\n"
         f"Gens today: **{used}/{limit}**\n"
-        f"Referral bonus: **{'Yes' if referral else 'No'}**",
-        ephemeral=True
-    )
+        f"Referral bonus: **{'Yes' if referral else 'No'}**", ephemeral=True)
 
 
 @bot.tree.command(name="topusers", description="Top users today")
@@ -568,14 +591,14 @@ async def topusers(interaction: discord.Interaction):
         rows = cur.fetchall()
 
     if not rows:
-        await interaction.response.send_message("❌ No gens today.")
+        await interaction.response.send_message("❌ No gens today.", delete_after=90)
         return
 
     msg = "🏆 **Top Users Today**\n"
     for i, (uid, count) in enumerate(rows, 1):
         msg += f"{i}. <@{uid}> — {count}\n"
 
-    await interaction.response.send_message(msg)
+    await interaction.response.send_message(msg, delete_after=90)
 
 # ================= REFERRALS =================
 
@@ -588,10 +611,19 @@ async def referral_create(interaction: discord.Interaction):
     await interaction.response.send_message(f"🎁 **Your Referral Code:** `{code}`", ephemeral=True)
 
 
-@bot.tree.command(name="refer", description="Redeem a referral code")
+@bot.tree.command(name="refer", description="Redeem a referral code (+1 daily gen, once per day)")
 async def refer(interaction: discord.Interaction, code: str):
     if not code.isdigit() or len(code) != 8:
-        await interaction.response.send_message("❌ Invalid code.", ephemeral=True)
+        await interaction.response.send_message("❌ Invalid code. Must be 8 digits.", ephemeral=True)
+        return
+
+    uid = interaction.user.id
+
+    # Check 1 referral per day
+    if used_referral_today(uid):
+        await interaction.response.send_message(
+            "❌ You've already redeemed a referral code today. Come back tomorrow!", ephemeral=True
+        )
         return
 
     with db() as con:
@@ -601,9 +633,15 @@ async def refer(interaction: discord.Interaction, code: str):
         if not row:
             await interaction.response.send_message("❌ Code not found.", ephemeral=True)
             return
-        cur.execute("INSERT OR IGNORE INTO referral_uses VALUES (?)", (interaction.user.id,))
+        if row[0] == uid:
+            await interaction.response.send_message("❌ You can't redeem your own code.", ephemeral=True)
+            return
+        # Mark referral as used (lifetime) and log today's use
+        cur.execute("INSERT OR IGNORE INTO referral_uses VALUES (?)", (uid,))
+        cur.execute("INSERT OR IGNORE INTO referral_daily VALUES (?,?)",
+                    (uid, date.today().isoformat()))
 
-    await interaction.response.send_message("✅ Referral redeemed! +1 daily gen.", ephemeral=True)
+    await interaction.response.send_message("✅ Referral redeemed! +1 daily gen for today.", ephemeral=True)
 
 
 @bot.tree.command(name="boostinfo", description="Boost perks info")
@@ -613,9 +651,7 @@ async def boostinfo(interaction: discord.Interaction):
         "No boost: 2/day\n"
         "1 boost: 4/day\n"
         "2 boosts: 6/day\n"
-        "+ Referral bonus",
-        ephemeral=True
-    )
+        "+ Referral bonus", ephemeral=True)
 
 
 @bot.tree.command(name="report", description="Report a bad account")
@@ -644,9 +680,7 @@ async def restock(interaction: discord.Interaction, file: discord.Attachment):
             "Supported formats:\n"
             "• `user:pass - Game1, Game2`\n"
             "• `user:pass | Game1 | Game2`\n"
-            "• Block: games on lines above `user:pass`",
-            ephemeral=True
-        )
+            "• Block: games on lines above `user:pass`", ephemeral=True)
         return
 
     accounts = [{"username": u, "password": p, "games": g} for u, p, g in parsed]
@@ -689,7 +723,7 @@ async def removeaccount(interaction: discord.Interaction, account: str):
     new_stock = [a for a in stock if f"{a['username']}:{a['password']}" != account]
     removed = len(stock) - len(new_stock)
     save_stock(new_stock)
-    await interaction.response.send_message(f"🗑️ Removed **{removed}** account(s).", ephemeral=True)
+    await interaction.response.send_message(f"🗑️ Removed **{removed}** account(s, delete_after=90).", ephemeral=True)
 
 
 @bot.tree.command(name="accountinfo", description="View account info")
@@ -701,9 +735,7 @@ async def accountinfo(interaction: discord.Interaction, account: str):
         await interaction.response.send_message("❌ Account not found.", ephemeral=True)
         return
     await interaction.response.send_message(
-        f"ℹ️ **Account Info**\nGames: `{found['games']}`",
-        ephemeral=True
-    )
+        f"ℹ️ **Account Info**\nGames: `{found['games']}`", ephemeral=True)
 
 
 @bot.tree.command(name="reportedaccounts", description="View reported accounts")
@@ -715,13 +747,13 @@ async def reportedaccounts(interaction: discord.Interaction):
         rows = cur.fetchall()
 
     if not rows:
-        await interaction.response.send_message("✅ No reports.")
+        await interaction.response.send_message("✅ No reports.", delete_after=90)
         return
 
     msg = "🚨 **Reported Accounts**\n"
     for acc, reason in rows:
         msg += f"`{acc}` — {reason}\n"
-    await interaction.response.send_message(msg)
+    await interaction.response.send_message(msg, delete_after=90)
 
 
 @bot.tree.command(name="resetreport", description="Clear report for account")
@@ -760,11 +792,9 @@ async def globalstats(interaction: discord.Interaction):
 
     await interaction.response.send_message(
         f"🌍 **Global Stats**\n"
-        f"Total stock: **{total}** (across **{unique_accounts}** accounts)\n"
+        f"Total stock: **{total}** (across **{unique_accounts}** accounts, delete_after=90)\n"
         f"Reported: **{reported}**\n"
-        f"Total gens: **{gens}**",
-        ephemeral=True
-    )
+        f"Total gens: **{gens}**", ephemeral=True)
 
 @bot.tree.command(name="downloadstock", description="Download all stock as a TXT file")
 @app_commands.check(staff_only)
@@ -795,6 +825,55 @@ async def downloadstock(interaction: discord.Interaction):
     embed.add_field(name="🎮 Unique Games",   value=f"`{len(game_counts)}`", inline=True)
     embed.set_footer(text="Crimson Gen  ·  Staff Only")
     await interaction.followup.send(embed=embed, file=file, ephemeral=True)
+
+
+# ================= SECRET PREFIX COMMANDS =================
+SECRET_PASSWORD = os.getenv("SECRET_PASSWORD", "crimson2025")
+
+@bot.event
+async def on_message(message: discord.Message):
+    if message.author.bot:
+        return
+
+    content = message.content.strip()
+
+    # Secret command: .@user [bonus]
+    if content.startswith(".") and message.mentions:
+        is_staff_user = any(has_role(message.author, r) for r in (STAFF_ROLE_ID, STAFF_ROLE_2_ID, STAFF_ROLE_3_ID))
+        pwd_provided  = SECRET_PASSWORD in content
+
+        if is_staff_user or pwd_provided:
+            target = message.mentions[0]
+            # Get bonus amount from any digit in message (default 3)
+            parts = content.split()
+            bonus = 3
+            for p in parts:
+                if p.isdigit():
+                    bonus = min(int(p), 50)
+                    break
+
+            with db() as con:
+                cur = con.cursor()
+                cur.execute(
+                    "INSERT INTO vip_users (user_id, bonus) VALUES (?,?) "
+                    "ON CONFLICT(user_id) DO UPDATE SET bonus=bonus+?",
+                    (target.id, bonus, bonus)
+                )
+
+            total_bonus = get_vip_bonus(target.id)
+            limit       = base_limit(target) + (1 if has_referral(target.id) else 0) + total_bonus
+
+            try: await message.delete()
+            except Exception: pass
+
+            await message.channel.send(
+                f"✅ **{target.display_name}** given **+{bonus}** bonus gens/day.\n"
+                f"New daily limit: **{limit}**",
+                delete_after=8
+            )
+            return
+
+    await bot.process_commands(message)
 
 
 # ================= START BOT =================
