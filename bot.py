@@ -30,9 +30,6 @@ intents.members = True
 
 bot = commands.Bot(command_prefix="!", intents=intents)
 
-# Ensure DB and tables exist immediately on startup
-init_db()
-
 # ================= DATABASE =================
 def db():
     return sqlite3.connect(DB_PATH)
@@ -99,6 +96,9 @@ def init_db():
                 print(f"✅ Migrated {migrated} accounts from stock.json to DB")
             except Exception as e:
                 print(f"⚠️ Migration skipped: {e}")
+
+# Run immediately so tables exist before any command fires
+init_db()
 
 
 def load_stock() -> list:
