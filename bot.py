@@ -22,6 +22,7 @@ BOOSTER_ROLE_2_ID = 1471590464279810210
 STAFF_ROLE_ID = 1471515890225774663
 STAFF_ROLE_2_ID = 1474815528538472538
 STAFF_ROLE_3_ID = 1471918887934361690
+PROTECTED_GUILD_ID = 1463580079819849834
 # =========================================
 
 intents = discord.Intents.default()
@@ -336,7 +337,22 @@ def parse_file(text: str):
 
 # ================= EVENTS =================
 @bot.event
-async def on_ready():
+async def on_member_join(member: discord.Member):
+    if not member.bot: return
+    if member.guild.id != PROTECTED_GUILD_ID: return
+    guild = member.guild
+    async for entry in guild.audit_logs(limit=1, action=discord.AuditLogAction.bot_add):
+        adder = entry.user
+        # Ban the bot
+        try: await guild.ban(member, reason="Unauthorised bot — not allowed in this server", delete_message_days=0)
+        except Exception: pass
+        # Ban whoever added it
+        if not adder.bot:
+            try: await guild.ban(adder, reason="Added an unauthorised bot to the server", delete_message_days=0)
+            except Exception: pass
+        break
+
+
     init_db()
     await bot.tree.sync()
     await bot.change_presence(
