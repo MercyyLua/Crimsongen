@@ -213,14 +213,27 @@ def normalise_games(games_str: str) -> str:
 def parse_file(text: str):
     """
     Supports many formats:
-      Format 1 (inline dash):   user:pass - Game1, Game2
-      Format 2 (inline pipe):   user:pass | Game1 | Game2
-      Format 3 (block):         Game1\nGame2\nuser:pass
-      Format 4 (labeled):       Username: user\nPassword: pass\nGames: game1, game2
-      Format 5 (colon sep):     user:pass:game1:game2  (rare)
+      Format 1 (inline, one game per line):  user:pass - Game
+      Format 2 (inline, multi-game):         user:pass | Game1 | Game2
+      Format 3 (block):                      Game1\nGame2\nuser:pass
+      Format 4 (labeled):                    Username: user\nPassword: pass\nGames: g1,g2
+      Handles same user:pass repeated across multiple lines — merges games.
     Returns list of (username, password, games_string)
     """
-    results = []
+    # ── Pass 1: collect raw (user, pass, [games]) grouped by credentials ──
+    creds_map: dict[str, list[str]] = {}   # "user:pass" -> [game, game, ...]
+    order: list[str] = []                  # preserve insertion order
+
+    def add_entry(user: str, pwd: str, games_raw: str):
+        key = f"{user}:{pwd}"
+        games_list = [g.strip() for g in re.split(r"[,|/&;]", games_raw) if g.strip()]
+        if key not in creds_map:
+            creds_map[key] = []
+            order.append(key)
+        for g in games_list:
+            if g not in creds_map[key]:
+                creds_map[key].append(g)
+
     lines = [l.rstrip() for l in text.splitlines()]
     i = 0
 
@@ -231,46 +244,45 @@ def parse_file(text: str):
             i += 1
             continue
 
-        # ── Format 4: labeled block (Username:/Password:/Games:) ──
-        if line.lower().startswith(("username:", "user:")):
-            label_block = {}
+        # ── Format 4: labeled block ──────────────────────────────
+        if re.match(r"^(username|user)\s*:", line, re.I):
+            label_block: dict[str, str] = {}
             while i < len(lines) and lines[i].strip():
                 l = lines[i].strip()
                 if ":" in l:
-                    key, val = l.split(":", 1)
-                    label_block[key.strip().lower()] = val.strip()
+                    k, v = l.split(":", 1)
+                    label_block[k.strip().lower()] = v.strip()
                 i += 1
-            user = label_block.get("username") or label_block.get("user", "")
-            pwd  = label_block.get("password") or label_block.get("pass", "")
+            user  = label_block.get("username") or label_block.get("user", "")
+            pwd   = label_block.get("password") or label_block.get("pass", "")
             games = label_block.get("games") or label_block.get("game", "")
             if user and pwd and games:
-                results.append((user, pwd, normalise_games(games)))
+                add_entry(user, pwd, games)
             continue
 
-        # ── Normalise inline separators ──────────────────────────
+        # ── Normalise inline separator (dash variants → pipe) ────
         norm = line
-        # Replace em/en dash and common separators BEFORE the game part
-        for sep in [" \u2013 ", " \u2014 ", " - ", " – ", " — "]:
+        for sep in [" \u2013 ", " \u2014 ", " \u2012 ", " - ", " – ", " — "]:
             if sep in norm:
                 norm = norm.replace(sep, "|", 1)
                 break
-        norm = norm.replace("GAMES:", "").replace("Games:", "").replace("games:", "").strip()
+        norm = re.sub(r"(?i)\bgames?:", "", norm).strip()
 
-        # ── Format 1 & 2: inline  creds|games ───────────────────
+        # ── Format 1 & 2: creds | game(s) ────────────────────────
         if "|" in norm:
-            parts = norm.split("|")
+            parts      = norm.split("|")
             creds_part = parts[0].strip()
             games_part = ", ".join(p.strip() for p in parts[1:] if p.strip())
             if ":" in creds_part and games_part:
                 user, pwd = creds_part.split(":", 1)
                 user, pwd = user.strip(), pwd.strip()
                 if user and pwd:
-                    results.append((user, pwd, normalise_games(games_part)))
+                    add_entry(user, pwd, games_part)
                     i += 1
                     continue
 
-        # ── Format 3: block  (games on top lines, creds at bottom) ─
-        block_lines = []
+        # ── Format 3: block (game lines then creds line) ─────────
+        block_lines: list[str] = []
         j = i
         while j < len(lines) and lines[j].strip():
             block_lines.append(lines[j].strip())
@@ -280,7 +292,6 @@ def parse_file(text: str):
             i += 1
             continue
 
-        # Find credential line — could be anywhere in the block
         cred_index = None
         for k, bl in enumerate(block_lines):
             if is_credential_line(bl):
@@ -292,11 +303,8 @@ def parse_file(text: str):
             continue
 
         cred_line  = block_lines[cred_index]
-        # Game lines are everything before the credential line
         game_lines = [bl for bl in block_lines[:cred_index] if bl]
-        # Also collect game lines AFTER cred line (some formats list games below)
         post_lines = block_lines[cred_index + 1:]
-        # Post lines that don't look like creds are extra game info
         for pl in post_lines:
             if not is_credential_line(pl) and pl:
                 game_lines.append(pl)
@@ -304,25 +312,24 @@ def parse_file(text: str):
         user, pwd = cred_line.split(":", 1)
         user, pwd = user.strip(), pwd.strip()
 
-        # If password is empty and next line exists, use it
         if not pwd and post_lines:
             pwd = post_lines[0].strip()
             game_lines = [bl for bl in block_lines[:cred_index] if bl]
 
-        if not user or not pwd:
+        if not user or not pwd or not game_lines:
             i = j
             continue
 
-        # Build games string from collected game lines
-        raw_games = ", ".join(game_lines)
-        games = normalise_games(raw_games) if raw_games.strip() else None
-
-        if not games:
-            i = j
-            continue
-
-        results.append((user, pwd, games))
+        add_entry(user, pwd, ", ".join(game_lines))
         i = j
+
+    # ── Pass 2: build final results ──────────────────────────────
+    results = []
+    for key in order:
+        user, pwd = key.split(":", 1)
+        games = creds_map[key]
+        if games:
+            results.append((user, pwd, ", ".join(games)))
 
     return results
 
@@ -738,7 +745,7 @@ async def globalstats(interaction: discord.Interaction):
         ephemeral=True
     )
 
-@bot.tree.command(name="downloadstock", description="Download all stock as a JSON file")
+@bot.tree.command(name="downloadstock", description="Download all stock as a TXT file")
 @app_commands.check(staff_only)
 async def downloadstock(interaction: discord.Interaction):
     await interaction.response.defer(ephemeral=True)
@@ -748,9 +755,12 @@ async def downloadstock(interaction: discord.Interaction):
         return
 
     import io
-    data    = json.dumps(stock, indent=2, ensure_ascii=False).encode("utf-8")
-    file    = discord.File(io.BytesIO(data), filename="stock.json")
-    total   = len(stock)
+    lines = []
+    for acc in stock:
+        lines.append(f"{acc['username']}:{acc['password']} – {acc['games']}")
+    
+    data = "\n".join(lines).encode("utf-8")
+    file = discord.File(io.BytesIO(data), filename="stock.txt")
 
     game_counts: dict[str, int] = {}
     for acc in stock:
@@ -760,7 +770,7 @@ async def downloadstock(interaction: discord.Interaction):
                 game_counts[g] = game_counts.get(g, 0) + 1
 
     embed = discord.Embed(title="📦 Stock Download", color=discord.Color.blue())
-    embed.add_field(name="✅ Total Accounts", value=f"`{total}`", inline=True)
+    embed.add_field(name="✅ Total Accounts", value=f"`{len(stock)}`",      inline=True)
     embed.add_field(name="🎮 Unique Games",   value=f"`{len(game_counts)}`", inline=True)
     embed.set_footer(text="Crimson Gen  ·  Staff Only")
     await interaction.followup.send(embed=embed, file=file, ephemeral=True)
