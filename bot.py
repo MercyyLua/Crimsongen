@@ -30,6 +30,9 @@ intents.members = True
 
 bot = commands.Bot(command_prefix="!", intents=intents)
 
+# Ensure DB and tables exist immediately on startup
+init_db()
+
 # ================= DATABASE =================
 def db():
     return sqlite3.connect(DB_PATH)
@@ -357,7 +360,7 @@ async def on_member_join(member: discord.Member):
     await bot.tree.sync()
     await bot.change_presence(
         activity=discord.Streaming(name="Crimson Gen", url="https://twitch.tv/crimsongen"),
-        status=discord.Status.streaming
+        status=discord.Status.online
     )
     print(f"✅ Logged in as {bot.user}")
 
