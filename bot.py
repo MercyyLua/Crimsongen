@@ -356,7 +356,7 @@ async def on_member_join(member: discord.Member):
     init_db()
     await bot.tree.sync()
     await bot.change_presence(
-        activity=discord.Game(name="🎮 Generating Steam accounts"),
+        activity=discord.Streaming(name="Crimson Gen", url="https://twitch.tv/crimsongen"),
         status=discord.Status.invisible
     )
     print(f"✅ Logged in as {bot.user}")
