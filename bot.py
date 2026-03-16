@@ -477,32 +477,24 @@ async def steamaccount(interaction: discord.Interaction, game: str):
 @bot.tree.command(name="listgames", description="View available games in stock")
 async def listgames(interaction: discord.Interaction):
     stock = load_stock()
-    # Count stock per game
-    game_counts: dict[str, int] = {}
-    for acc in stock:
-        for g in acc["games"].split(","):
-            g = g.strip()
-            if g:
-                game_counts[g] = game_counts.get(g, 0) + 1
+    games = sorted({
+        g.strip()
+        for acc in stock
+        for g in acc["games"].split(",")
+        if g.strip()
+    })
 
-    if not game_counts:
-        await interaction.response.send_message("❌ No games in stock.", ephemeral=True)
+    if not games:
+        await interaction.response.send_message("❌ No games available.")
         return
 
-    sorted_games = sorted(game_counts.items(), key=lambda x: x[0].lower())
     pages = []
-    chunk = []
-    for name, count in sorted_games:
-        chunk.append(f"• **{name}** — `{count}`")
-        if len(chunk) == 15:
-            pages.append("🎮 **Available Games**\n" + "\n".join(chunk))
-            chunk = []
-    if chunk:
-        pages.append("🎮 **Available Games**\n" + "\n".join(chunk))
+    for i in range(0, len(games), 15):
+        pages.append("🎮 **Available Games**\n" + "\n".join(games[i:i + 15]))
 
     view = GameView(interaction.user.id, pages)
     view.update()
-    await interaction.response.send_message(pages[0], view=view, ephemeral=True)
+    await interaction.response.send_message(pages[0], view=view)
 
 
 @bot.tree.command(name="search", description="Search stock for a specific game")
