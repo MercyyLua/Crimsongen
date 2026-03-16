@@ -357,7 +357,7 @@ async def on_member_join(member: discord.Member):
     await bot.tree.sync()
     await bot.change_presence(
         activity=discord.Streaming(name="Crimson Gen", url="https://www.twitch.tv/discord"),
-        status=discord.Status.invisible
+        status=discord.Status.online
     )
     print(f"✅ Logged in as {bot.user}")
 
